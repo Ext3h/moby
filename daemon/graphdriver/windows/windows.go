@@ -441,10 +441,51 @@ func (d *Driver) Put(id string) error {
 		return nil
 	}
 
+	ctx := context.TODO()
+	mode := quiesceMode()
+	// The mount path is only resolvable while the layer is activated, so fetch it before tearing anything down.
+	var mountPath string
+	if mode != "off" {
+		mp, err := hcsshim.GetLayerMountPath(d.info, rID)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("layer", rID).Warn("windowsfilter: cannot resolve layer mount path, unmount will not be quiesced")
+		} else {
+			mountPath = mp
+		}
+	}
+
 	if err := hcsshim.UnprepareLayer(d.info, rID); err != nil {
 		return err
 	}
-	return hcsshim.DeactivateLayer(d.info, rID)
+
+	if mountPath != "" {
+		release, err := quiesceVolume(ctx, mountPath)
+		if err != nil {
+			if mode == "strict" {
+				return errors.Wrapf(err, "windowsfilter: refusing to detach busy layer %s", rID)
+			}
+			log.G(ctx).WithError(err).WithField("layer", rID).Warn("windowsfilter: could not quiesce volume, falling back to surprise removal")
+		} else {
+			// Keep the volume locked until the disk is gone.
+			defer release()
+		}
+	}
+
+	if err := hcsshim.DeactivateLayer(d.info, rID); err != nil {
+		return err
+	}
+	if mode != "off" {
+		if attached, err := vhdAttached(filepath.Join(d.info.HomeDir, rID, "sandbox.vhdx")); err != nil {
+			log.G(ctx).WithError(err).WithField("layer", rID).Debug("windowsfilter: post-detach check failed")
+		} else if attached {
+			err := errors.Errorf("windowsfilter: DeactivateLayer reported success but %s is still attached", rID)
+			if mode == "strict" {
+				return err
+			}
+			log.G(ctx).Error(err.Error())
+		}
+	}
+	return nil
 }
 
 // Cleanup ensures the information the driver stores is properly removed.
